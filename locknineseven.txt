@@ -1,0 +1,100 @@
+#include "rwlock.h"
+#include <stdlib.h>
+#include <semaphore.h>
+#include <stdint.h>
+
+struct rwlock {
+    sem_t lock; // Protects access to readers count
+    sem_t writelock; // Ensures exclusive writer access
+    int readers; // Number of active readers
+    PRIORITY priority; // Which mode to use (READERS, WRITERS, or N_WAY)
+    uint32_t nway_value; // Maximum allowed concurrent readers for N_WAY mode
+    sem_t turnstile; // Used in WRITERS and N_WAY modes for writer priority
+    sem_t nway; // Used in N_WAY mode to limit concurrent readers
+};
+
+rwlock_t *rwlock_new(PRIORITY p, uint32_t n) {
+    rwlock_t *rw = malloc(sizeof(rwlock_t));
+    if (!rw)
+        return NULL;
+
+    rw->readers = 0;
+    rw->priority = p;
+    rw->nway_value = n;
+
+    sem_init(&rw->lock, 0, 1);
+    sem_init(&rw->writelock, 0, 1);
+
+    // For WRITERS mode and N_WAY mode, initialize a turnstile semaphore.
+    if (p == WRITERS || p == N_WAY) {
+        sem_init(&rw->turnstile, 0, 1);
+    }
+    // For N_WAY mode, initialize a semaphore to limit concurrent readers.
+    if (p == N_WAY) {
+        sem_init(&rw->nway, 0, n);
+    }
+
+    return rw;
+}
+
+void rwlock_delete(rwlock_t **rw) {
+    if (!rw || !*rw)
+        return;
+
+    sem_destroy(&(*rw)->lock);
+    sem_destroy(&(*rw)->writelock);
+    if ((*rw)->priority == WRITERS || (*rw)->priority == N_WAY) {
+        sem_destroy(&(*rw)->turnstile);
+    }
+    if ((*rw)->priority == N_WAY) {
+        sem_destroy(&(*rw)->nway);
+    }
+    free(*rw);
+    *rw = NULL;
+}
+
+void reader_lock(rwlock_t *rw) {
+    // In WRITERS or N_WAY mode, readers must pass through the turnstile.
+    if (rw->priority == WRITERS || rw->priority == N_WAY) {
+        sem_wait(&rw->turnstile);
+        sem_post(&rw->turnstile);
+    }
+    // In N_WAY mode, limit the number of concurrent readers.
+    if (rw->priority == N_WAY) {
+        sem_wait(&rw->nway);
+    }
+    sem_wait(&rw->lock);
+    rw->readers++;
+    if (rw->readers == 1) { // First reader locks out writers.
+        sem_wait(&rw->writelock);
+    }
+    sem_post(&rw->lock);
+}
+
+void reader_unlock(rwlock_t *rw) {
+    sem_wait(&rw->lock);
+    rw->readers--;
+    if (rw->readers == 0) { // Last reader releases writer lock.
+        sem_post(&rw->writelock);
+    }
+    sem_post(&rw->lock);
+    // In N_WAY mode, release a slot for another reader.
+    if (rw->priority == N_WAY) {
+        sem_post(&rw->nway);
+    }
+}
+
+void writer_lock(rwlock_t *rw) {
+    // In WRITERS or N_WAY mode, lock the turnstile so no new readers can enter.
+    if (rw->priority == WRITERS || rw->priority == N_WAY) {
+        sem_wait(&rw->turnstile);
+    }
+    sem_wait(&rw->writelock);
+}
+
+void writer_unlock(rwlock_t *rw) {
+    sem_post(&rw->writelock);
+    if (rw->priority == WRITERS || rw->priority == N_WAY) {
+        sem_post(&rw->turnstile);
+    }
+}
